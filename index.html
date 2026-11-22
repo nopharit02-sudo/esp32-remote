@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32 Remote</title>
+<style>
+:root{--bg:#f3f4f8;--card:#fff;--text:#161a23;--mut:#6b7385;--line:#e4e7ee;--acc:#4f46e5;--on:#16a34a;--off:#9aa3b5;--danger:#dc2626}
+@media(prefers-color-scheme:dark){:root{--bg:#0e1117;--card:#181c25;--text:#eef0f5;--mut:#98a1b3;--line:#272c38;--off:#4a5264}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,"Noto Sans Thai",sans-serif}
+[hidden]{display:none!important}
+header{display:flex;justify-content:space-between;align-items:center;padding:22px 20px 8px;max-width:760px;margin:auto}
+h1{margin:0;font-size:1.35rem}
+small,.mut{color:var(--mut);font-size:.85rem}
+main{max-width:760px;margin:auto;padding:12px 20px 40px}
+.st{display:flex;align-items:center;gap:8px;margin-top:4px}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--off)}
+.dot.ok{background:var(--on)}
+#grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:16px;display:flex;flex-direction:column;gap:14px;transition:.2s}
+.card.on{border-color:var(--on);box-shadow:0 0 0 3px color-mix(in srgb,var(--on) 18%,transparent)}
+.nm{font-weight:600;word-break:break-word}
+.pin{color:var(--mut);font-size:.75rem;margin-top:2px}
+.sw{position:relative;width:56px;height:32px;display:block;margin:0}
+.sw input{opacity:0;width:0;height:0}
+.sw span{position:absolute;inset:0;background:var(--off);border-radius:32px;transition:.2s;cursor:pointer}
+.sw span:before{content:"";position:absolute;width:26px;height:26px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s}
+.sw input:checked+span{background:var(--on)}
+.sw input:checked+span:before{transform:translateX(24px)}
+.sw input:disabled+span{opacity:.45;cursor:not-allowed}
+button{font:inherit;cursor:pointer;border:0;border-radius:12px;padding:11px 16px;background:var(--acc);color:#fff;font-weight:600}
+button:disabled{opacity:.5}
+button.ghost{background:transparent;color:var(--text);border:1px solid var(--line)}
+input{width:100%;padding:11px 12px;border-radius:10px;border:1px solid var(--line);background:var(--bg);color:var(--text);font:inherit}
+label{display:block;font-size:.8rem;color:var(--mut);margin:14px 0 6px}
+.setup{max-width:420px;margin:auto;padding:28px 20px}
+.setup button{width:100%;margin-top:22px}
+.err{color:var(--danger);font-size:.85rem;margin-top:12px;min-height:1em}
+.empty{color:var(--mut);padding:30px 0;text-align:center}
+</style>
+</head>
+<body>
+
+<div class="setup" id="login">
+  <h1>ESP32 Remote</h1>
+  <p class="mut">เข้าสู่ระบบด้วยบัญชี MQTT broker (บัญชีสำหรับเว็บ)</p>
+  <label for="host">Broker host</label>
+  <input id="host" placeholder="xxxxxxxx.s1.eu.hivemq.cloud" autocomplete="off">
+  <label for="user">ชื่อผู้ใช้</label>
+  <input id="user" autocomplete="username">
+  <label for="pass">รหัสผ่าน</label>
+  <input id="pass" type="password" autocomplete="current-password">
+  <label for="base">Topic หลัก (ต้องตรงกับที่ตั้งในบอร์ด)</label>
+  <input id="base" placeholder="home/esp32" autocomplete="off">
+  <button id="go">เข้าสู่ระบบ</button>
+  <div class="err" id="err"></div>
+</div>
+
+<div id="app" hidden>
+  <header>
+    <div><h1>ESP32 Remote</h1><div class="st"><span class="dot" id="dot"></span><small id="stat">กำลังเชื่อมต่อ...</small></div></div>
+    <button class="ghost" id="out">ออกจากระบบ</button>
+  </header>
+  <main>
+    <div id="grid"></div>
+    <p class="mut" style="text-align:center;margin-top:24px">เพิ่ม/ลบปุ่มและกำหนดขา ทำได้จากหน้าเว็บของบอร์ดตอนอยู่ในบ้าน</p>
+  </main>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+let client, base = "", list = [], online = false, gotState = false;
+
+try {
+  $("host").value = localStorage.getItem("host") || "";
+  $("user").value = localStorage.getItem("user") || "";
+  $("base").value = localStorage.getItem("base") || "home/esp32";
+} catch (e) {}
+
+const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+function show(on){ $("login").hidden = on; $("app").hidden = !on; }
+function resetBtn(){ $("go").disabled = false; $("go").textContent = "เข้าสู่ระบบ"; }
+
+function render(){
+  $("dot").className = "dot" + (online ? " ok" : "");
+  $("stat").textContent = online ? "บอร์ดออนไลน์" : (gotState ? "บอร์ดออฟไลน์" : "รอข้อมูลจากบอร์ด...");
+  if (!list.length){ $("grid").innerHTML = '<div class="empty" style="grid-column:1/-1">ยังไม่มีข้อมูลปุ่ม</div>'; return; }
+  $("grid").innerHTML = list.map((b, i) =>
+    `<div class="card ${b.s ? "on" : ""}"><div><div class="nm">${esc(b.n)}</div><div class="pin">GPIO ${b.p}</div></div>` +
+    `<label class="sw"><input type="checkbox" ${b.s ? "checked" : ""} ${online ? "" : "disabled"} onchange="tog(${i},this.checked)"><span></span></label></div>`
+  ).join("");
+}
+
+function tog(i, on){ client.publish(base + "/set", i + "," + (on ? 1 : 0)); }
+
+function login(){
+  const host = $("host").value.trim(), user = $("user").value.trim(), pass = $("pass").value;
+  base = $("base").value.trim().replace(/[#+\s]/g, "") || "home/esp32";
+  $("err").textContent = "";
+  if (!host || !user || !pass){ $("err").textContent = "กรอกข้อมูลให้ครบ"; return; }
+  $("go").disabled = true; $("go").textContent = "กำลังเชื่อมต่อ...";
+  gotState = false; online = false; list = [];
+
+  client = mqtt.connect("wss://" + host + ":8884/mqtt", {
+    username: user, password: pass,
+    clientId: "web-" + Math.random().toString(16).slice(2),
+    reconnectPeriod: 0, connectTimeout: 8000
+  });
+
+  client.on("connect", () => {
+    try { localStorage.setItem("host", host); localStorage.setItem("user", user); localStorage.setItem("base", base); } catch (e) {}
+    $("pass").value = "";
+    client.options.reconnectPeriod = 3000;
+    client.subscribe([base + "/state", base + "/online"]);
+    show(true); render();
+  });
+
+  client.on("message", (t, m) => {
+    const v = m.toString();
+    if (t === base + "/online") online = (v === "1");
+    else if (t === base + "/state") {
+      try { list = JSON.parse(v).b || []; gotState = true; } catch (e) {}
+    }
+    render();
+  });
+
+  client.on("error", e => {
+    $("err").textContent = /not authori|bad user/i.test(e.message) ? "ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง" : "เชื่อมต่อไม่ได้: " + e.message;
+    client.end(true); resetBtn();
+  });
+
+  client.on("close", () => {
+    if ($("app").hidden){
+      if (!$("err").textContent) $("err").textContent = "เชื่อมต่อไม่ได้ ตรวจสอบ host และข้อมูลเข้าสู่ระบบ";
+      resetBtn();
+    } else { $("stat").textContent = "หลุดการเชื่อมต่อ กำลังลองใหม่..."; $("dot").className = "dot"; online = false; }
+  });
+}
+
+$("go").onclick = login;
+$("pass").addEventListener("keydown", e => { if (e.key === "Enter") login(); });
+$("out").onclick = () => { if (client) client.end(true); show(false); resetBtn(); };
+</script>
+</body>
+</html>
